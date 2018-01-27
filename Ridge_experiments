@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Jan  6 14:25:20 2018
+
+@author: mohsin
+"""
+
+import gc
+import time
+import numpy as np
+import pandas as pd
+import os
+import pickle
+
+from joblib import Parallel, delayed
+
+from scipy.sparse import csr_matrix, hstack
+
+from sklearn.linear_model import Ridge
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.linear_model import SGDRegressor
+from sklearn import metrics
+
+from sklearn.model_selection import train_test_split, cross_val_score, cross_val_predict, KFold
+from sklearn.preprocessing import LabelBinarizer, MaxAbsScaler, OneHotEncoder
+from sklearn.pipeline import make_pipeline, make_union, FeatureUnion
+
+import lightgbm as lgb
+from nltk.stem.snowball import SnowballStemmer
+import Stemmer
+
+from fuzzywuzzy import fuzz, process
+
+#Class for target encoding features
+from sklearn.base import BaseEstimator, TransformerMixin
+class TargetEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, cols=None, thresh=0, func=np.mean, add_to_orig=False):
+        self.cols = cols
+        self.thresh = thresh
+        self.func = func
+        self.add_to_orig = add_to_orig
+    
+    #@numba.jit        
+    def fit(self, X, y):
+        self.prior = self.func(y)
+        self._dict = {}
+        for col in self.cols:
+            if isinstance(col, (list, tuple)):
+                print('here')
+                tmp_df = X.loc[: ,col]
+                col = tuple(col)
+            else:
+                tmp_df = X.loc[: ,[col]]
+            tmp_df['y'] = y
+            print(tmp_df.columns)
+            #tmp_df = pd.DataFrame({'eval_col':X[col].values, 'y':y})
+            if isinstance(col, (list, tuple)):
+                print('here')
+                col = tuple(col)
+            self._dict[col] = tmp_df.groupby(col)['y'].apply(lambda x: 
+                                self.func(x) if len(x) >= self.thresh  else self.prior).to_dict()
+                                
+            del tmp_df
+        return self
+    #@numba.jit
+    def transform(self, X, y=None):
+        X_transformed = []
+        for col in self.cols:
+            
+            if isinstance(col, (list, tuple)):
+                tmp_df = X.loc[:, col]
+                enc = tmp_df[col].apply(lambda x: self._dict[tuple(col)][tuple(x)]
+                                                                     if tuple(x) in self._dict[tuple(col)]
+                                                                     else self.prior, axis=1).values
+            else:
+                tmp_df = X.loc[:, [col]]
+                enc = tmp_df[col].apply(lambda x: self._dict[col][x]
+                                                                     if x in self._dict[col]
+                                                                     else self.prior).values
+            del tmp_df
+            X_transformed.append(enc)
+        
+        X_transformed = np.vstack(X_transformed).T
+        
+        if self.add_to_orig:
+            return np.concatenate((X.values, X_transformed), axis=1)
+            
+        else:
+            return X_transformed
+#%%
+#Calculate rmse        
+def rmse(y_true, y_pred):
+    return np.sqrt(metrics.mean_squared_error(y_true, y_pred))
+
+def impute_nan(df):
+    df = df.copy()
+    df = df.fillna('missing') #Ensure string columns are handled properly downstream
+    return df
+
+def to_string(df):
+    df = df.copy()
+    df = impute_nan(df)
+    #string_cols = ["name", "brand_name", "category_name", "item_description"]
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    return df
+
+
+#def infrequent_to_nan(df, limit_dict):
+#    """Limit max """
+#    df = df.copy()
+#    for k,v in limit_dict.items():
+#        if k in df.columns:
+#            valid_vals = df[k].value_counts().iloc[:v].index
+#            df.loc[~df[k].isin(valid_vals), k] = '-2'
+#            
+#    return df
+#%%#Build vocab
+def build_vocab(df, cols, **kwargs):
+    cv = CountVectorizer(**kwargs)
+    if isinstance(cols, list) > 1:
+        cv.fit(df[cols].apply(lambda x: ' '.join(x.tolist()), axis=1))
+    else:
+        cv.fit(df[cols])
+    return cv.vocabulary_
+#%%
+#Fit count vectorizer or tfidf with given vocab
+def vectorize_col(df, col, vocab, kind='count', **kwargs):
+    if kind == 'count':
+        cv = CountVectorizer(**kwargs).set_params(vocabulary=vocab)
+    elif kind == 'tfidf':
+        cv = CountVectorizer(**kwargs).set_params(vocabulary=vocab)
+    else:
+        raise ValueError("Bad option")
+    return cv.fit_transform(df[col])
+
+#Split category name into sub categories
+def split_cat(text):
+    try: return text.split("/")
+    except: return ("No Label", "No Label", "No Label")
+    
+def get_sub_categories(df):
+    df = df.copy()
+    a, b, c = zip(*df['category_name'].apply(lambda x: split_cat(x)))
+    df["cat1"]=a
+    df["cat2"]=b
+    df["cat3"]=c
+    return df
+
+#Now get other features
+def count_features(df):
+    name_word_counts = df["name"].apply(lambda  x: len(str(x).split())).values
+    name_char_counts = df["name"].apply(lambda  x: len(str(x))).values
+    desc_word_counts = df["item_description"].apply(lambda  x: len(str(x).split())).values
+    desc_char_counts = df["item_description"].apply(lambda  x: len(str(x))).values
+    return np.vstack((name_word_counts, name_char_counts, desc_word_counts, desc_char_counts)).T
+
+default_preprocessor = CountVectorizer().build_preprocessor()
+def build_preprocessor(df, field):
+    field_idx = list(df.columns).index(field)
+    return lambda x: default_preprocessor(x[field_idx])
+
+stemmer = Stemmer.Stemmer("en")
+default_analyzer = CountVectorizer().build_analyzer()
+def build_analyzer(df, field):
+    field_idx = list(df.columns).index(field)
+    return lambda x: stemmer.stemWords(default_analyzer(x[field_idx]))
+
+#Get brand value feature in cv fashion
+#def get_brand_value()
+#%%
+#Impute missing brand names using fuzzy matching technique
+# TBD
+def run_experiment2(df, extra_feats, nrow_train, cvlist, y):
+    config0 = [1, 12000, (1, 3),
+               6000, '.+',
+               1, 1500, '.+',  (1, 1),
+               5, 100000, (1, 3)]
+    config1 = [1, 10000, (1, 2),
+               6000, '.+',
+               5, 1500, '.+', (1, 1),
+               10, 50000, (1, 3)]
+    config2 = [2, 10000, (1, 2),
+               6000, '.+',
+               5, 1500, '(?u)\b\w\w+\b',  (1, 3),
+               10, 20000, (1, 3)]
+    config3 = [2, 10000, (1, 3),
+               4000, '.+',
+               5, 1000, '.+', (1, 1),
+               10, 25000, (1, 3)]
+    config4 = [2, 10000, (1, 2),
+               6000, '.+',
+               5, 1500, '.+', (1, 1),
+               10, 100000, (1, 3)]
+    config5 = [1, 12000, (1, 3),
+               6000, '.+',
+               5, 1000, '(?u)\b\w\w+\b',  (1, 3),
+               10, 50000, (1, 3)]
+
+    
+    configs = [config0]
+    scores = []
+    start_time = time.time()
+    for i, config in enumerate(configs):
+        NAME_MIN_DF,  NAME_MAX_FEATURES,  NAME_NGRAM, \
+        BRAND_MAX_FEATURES, BRAND_TOKEN, \
+        CAT_MIN_DF,  CAT_MAX_FEATURES, CAT_TOKEN, CAT_NGRAM, \
+        DESC_MIN_DF, DESC_MAX_FEATURES, DESC_NGRAM = config
+        
+        name_cat_vocab = build_vocab(df, ['name', 'category_name'], **{'min_df':NAME_MIN_DF, 
+                                     'max_features':NAME_MAX_FEATURES, 'ngram_range':NAME_NGRAM})        
+        vectorizer = FeatureUnion([
+        ('name', CountVectorizer(
+            max_features=NAME_MAX_FEATURES,
+            ngram_range=NAME_NGRAM,
+            preprocessor=build_preprocessor(df, 'name'))),
+        ('brand_name', CountVectorizer(
+            max_features=BRAND_MAX_FEATURES,
+            token_pattern=BRAND_TOKEN,
+            preprocessor=build_preprocessor(df,  'brand_name'))),
+        ('cat1', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df,  'cat1'))),
+        ('cat2', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df,  'cat2'))),
+        ('cat3', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df,  'cat3'))),
+        ('shipping', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'shipping'))),
+        ('item_condition_id', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'item_condition_id'))),
+        ('category_name', CountVectorizer(
+            min_df = CAT_MIN_DF,
+            max_features= CAT_MAX_FEATURES,
+            token_pattern=CAT_TOKEN,
+            ngram_range=CAT_NGRAM,
+            preprocessor=build_preprocessor(df, 'category_name'))),
+        ('item_description', TfidfVectorizer(
+            min_df=DESC_MIN_DF,
+            ngram_range=DESC_NGRAM,
+            max_features=DESC_MAX_FEATURES,
+            preprocessor=build_preprocessor(df, 'item_description'))),
+        ('item_description_name', CountVectorizer(
+            min_df=NAME_MIN_DF,
+            ngram_range=NAME_NGRAM,
+            max_features=NAME_MAX_FEATURES,
+            vocabulary = name_cat_vocab,
+            preprocessor=build_preprocessor(df, 'item_description')))
+                ])
+        if False and os.path.exists("../utility/ridge_exp2_{}_feats.pkl".format(str(i))):
+            with open("../utility/ridge_exp2_{}_feats.pkl".format(str(i)), "rb") as f:
+                X_feats = pickle.load(f)
+        else:
+            X_feats = vectorizer.fit_transform(df.values)
+            with open("../utility/ridge_exp2_{}_feats.pkl".format(str(i)), "wb") as f:
+                pickle.dump(X_feats, f)
+        X_all = hstack((X_feats, extra_feats)).tocsr()
+        #X_all = X_feats
+        X_all = MaxAbsScaler().fit_transform(X_all)
+        X = X_all[:nrow_train]
+        X_test = X_all[nrow_train:]
+        del X_all
+        print("Starting modelling")
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has oof score of {}:".format(i, score))
+        scores.append(score)
+        
+        print("Level 2 modelling")
+        X = hstack((X, preds.reshape(-1, 1))).tocsr()
+        X = MaxAbsScaler().fit_transform(X)
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has level 2 oof score of {}:".format(i, score))
+
+        
+    best_i = np.argmax(scores)
+    best_config = configs[best_i]
+    
+    return best_config, X, X_test
+        
+def run_experiment1(df, extra_feats, nrow_train, cvlist, y):
+    config0 = [1, 20000, (1, 3),
+               6000, '.+',
+               1, 1500, '.+',  (1, 1),
+               5, 100000, (1, 3)]
+
+    
+    configs = [config0]
+    scores = []
+    #start_time = time.time()
+    for i, config in enumerate(configs):
+        NAME_MIN_DF,  NAME_MAX_FEATURES,  NAME_NGRAM, \
+        BRAND_MAX_FEATURES, BRAND_TOKEN, \
+        CAT_MIN_DF,  CAT_MAX_FEATURES, CAT_TOKEN, CAT_NGRAM, \
+        DESC_MIN_DF, DESC_MAX_FEATURES, DESC_NGRAM = config
+        
+        name_cat_vocab = build_vocab(df, ['name', 'category_name'], **{'min_df':NAME_MIN_DF, 
+                                     'max_features':NAME_MAX_FEATURES, 'ngram_range':NAME_NGRAM})
+        vectorizer = FeatureUnion([
+        ('name', CountVectorizer(
+            max_features=NAME_MAX_FEATURES,
+            ngram_range=NAME_NGRAM,
+            vocabulary = name_cat_vocab,
+            preprocessor=build_preprocessor(df, 'name'))),
+        ('brand_name', CountVectorizer(
+            max_features=BRAND_MAX_FEATURES,
+            token_pattern=BRAND_TOKEN,
+            preprocessor=build_preprocessor(df,  'brand_name'))),
+        #('cat1', CountVectorizer(
+        #    token_pattern='.+',
+        #    preprocessor=build_preprocessor(df,  'cat1'))),
+        #('cat2', CountVectorizer(
+        #    token_pattern='.+',
+        #    preprocessor=build_preprocessor(df,  'cat2'))),
+        #('cat3', CountVectorizer(
+        #    token_pattern='.+',
+        #    preprocessor=build_preprocessor(df,  'cat3'))),
+        ('shipping', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'shipping'))),
+        ('item_condition_id', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'item_condition_id'))),
+        ('category_name', CountVectorizer(
+            min_df = CAT_MIN_DF,
+            max_features= CAT_MAX_FEATURES,
+            token_pattern=CAT_TOKEN,
+            ngram_range=CAT_NGRAM,
+            preprocessor=build_preprocessor(df, 'category_name'))),
+        ('item_description', TfidfVectorizer(
+            min_df=DESC_MIN_DF,
+            ngram_range=DESC_NGRAM,
+            max_features=DESC_MAX_FEATURES,
+            preprocessor=build_preprocessor(df, 'item_description'))),
+        ('item_description_name', CountVectorizer(
+            min_df=NAME_MIN_DF,
+            ngram_range=NAME_NGRAM,
+            max_features=NAME_MAX_FEATURES,
+            vocabulary = name_cat_vocab,
+            preprocessor=build_preprocessor(df, 'item_description')))
+                ])
+        if False and os.path.exists("../utility/ridge_exp1_{}_feats.pkl".format(str(i))):
+            with open("../utility/ridge_exp1_{}_feats.pkl".format(str(i)), "rb") as f:
+                X_feats = pickle.load(f)
+        else:
+            X_feats = vectorizer.fit_transform(df.values)
+            with open("../utility/ridge_exp1_{}_feats.pkl".format(str(i)), "wb") as f:
+                pickle.dump(X_feats, f)
+        X_all = hstack((X_feats, extra_feats)).tocsr()
+        #X_all = X_feats
+        X_all = MaxAbsScaler().fit_transform(X_all)
+        X = X_all[:nrow_train]
+        X_test = X_all[nrow_train:]
+        del X_all
+        print("Starting modelling")
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has oof score of {}:".format(i, score))
+        scores.append(score)
+        
+        print("Level 2 modelling")
+        X = hstack((X, preds.reshape(-1, 1))).tocsr()
+        X = MaxAbsScaler().fit_transform(X)
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has level 2 oof score of {}:".format(i, score))
+        
+    best_i = np.argmax(scores)
+    best_config = configs[best_i]
+    
+    return best_config, X, X_test
+
+
+def run_experiment4(df, extra_feats, nrow_train, cvlist, y):
+    config0 = [1, 12000, (1, 3),
+               6000, '.+',
+               1, 1500, '.+',  (1, 1),
+               5, 100000, (1, 3)]
+
+    
+    #analyzer1 = build_analyzer(df, 'name')
+    #stemmer = SnowballStemmer("english")
+    #stemmer = Stemmer.Stemmer("en")
+#    def stemmed_words1(doc):
+#        return (stemmer.stem(w) for w in analyzer1(str(doc)))
+    #def stemmed_words1(doc):
+    #    return (stemmer.stemWords(analyzer1(str(doc))))
+    
+    #analyzer2 = build_analyzer(df, 'item_description')
+#    def stemmed_words2(doc):
+#        return (stemmer.stem(w) for w in analyzer2(str(doc)))
+    #def stemmed_words2(doc):
+    #    return (stemmer.stemWords(analyzer2(str(doc))))    
+    
+    configs = [config0]
+    scores = []
+    start_time = time.time()
+    for i, config in enumerate(configs):
+        NAME_MIN_DF,  NAME_MAX_FEATURES,  NAME_NGRAM, \
+        BRAND_MAX_FEATURES, BRAND_TOKEN, \
+        CAT_MIN_DF,  CAT_MAX_FEATURES, CAT_TOKEN, CAT_NGRAM, \
+        DESC_MIN_DF, DESC_MAX_FEATURES, DESC_NGRAM = config
+        
+        vectorizer = FeatureUnion([
+        ('name', CountVectorizer(
+            max_features=NAME_MAX_FEATURES,
+            ngram_range=NAME_NGRAM,
+            analyzer=build_analyzer(df, 'name'),
+            #preprocessor=build_preprocessor(df, 'name')
+            )),
+        ('brand_name', CountVectorizer(
+            max_features=BRAND_MAX_FEATURES,
+            token_pattern=BRAND_TOKEN,
+            preprocessor=build_preprocessor(df,  'brand_name'))),
+        #('cat1', CountVectorizer(
+        #    token_pattern='.+',
+        #    preprocessor=build_preprocessor(df,  'cat1'))),
+        #('cat2', CountVectorizer(
+        #    token_pattern='.+',
+        #    preprocessor=build_preprocessor(df,  'cat2'))),
+        #('cat3', CountVectorizer(
+        #    token_pattern='.+',
+        #    preprocessor=build_preprocessor(df,  'cat3'))),
+        ('shipping', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'shipping'))),
+        ('item_condition_id', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'item_condition_id'))),
+        ('category_name', CountVectorizer(
+            min_df = CAT_MIN_DF,
+            max_features= CAT_MAX_FEATURES,
+            token_pattern=CAT_TOKEN,
+            ngram_range=CAT_NGRAM,
+            preprocessor=build_preprocessor(df, 'category_name'))),
+        ('item_description', TfidfVectorizer(
+            min_df=DESC_MIN_DF,
+            ngram_range=DESC_NGRAM,
+            max_features=DESC_MAX_FEATURES,
+            analyzer=build_analyzer(df, 'item_description'),
+            #preprocessor=build_preprocessor(df, 'item_description')
+            )),
+            
+                ])
+        if False and os.path.exists("../utility/ridge_exp4_{}_feats.pkl".format(str(i))):
+            with open("../utility/ridge_exp4_{}_feats.pkl".format(str(i)), "rb") as f:
+                X_feats = pickle.load(f)
+        else:
+            X_feats = vectorizer.fit_transform(df.values)
+            print("Time taken for generating features".format((start_time - time.time())/60))
+            with open("../utility/ridge_exp4_{}_feats.pkl".format(str(i)), "wb") as f:
+                pickle.dump(X_feats, f)
+        X_all = hstack((X_feats, extra_feats)).tocsr()
+        #X_all = X_feats
+        X_all = MaxAbsScaler().fit_transform(X_all)
+        X = X_all[:nrow_train]
+        X_test = X_all[nrow_train:]
+        del X_all
+        print("Starting modelling")
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has oof score of {}:".format(i, score))
+        scores.append(score)
+        
+        print("Level 2 modelling")
+        X = hstack((X, preds.reshape(-1, 1))).tocsr()
+        X = MaxAbsScaler().fit_transform(X)
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has level 2 oof score of {}:".format(i, score))
+        
+    best_i = np.argmax(scores)
+    best_config = configs[best_i]
+    
+    return best_config, X, X_test
+
+def run_experiment5(df, extra_feats, nrow_train, cvlist, y):
+    config0 = [1, 12000, (1, 3),
+               6000, '.+',
+               1, 1500, '.+',  (1, 1),
+               5, 100000, (1, 3)]
+
+ 
+
+    configs = [config0]
+    scores = []
+    #start_time = time.time()
+    for i, config in enumerate(configs):
+        NAME_MIN_DF,  NAME_MAX_FEATURES,  NAME_NGRAM, \
+        BRAND_MAX_FEATURES, BRAND_TOKEN, \
+        CAT_MIN_DF,  CAT_MAX_FEATURES, CAT_TOKEN, CAT_NGRAM, \
+        DESC_MIN_DF, DESC_MAX_FEATURES, DESC_NGRAM = config
+
+        brand_vocab = build_vocab(df, 'brand_name', **{'max_features':10000, 'lowercase':False})           
+        vectorizer = FeatureUnion([
+        ('name', CountVectorizer(
+            max_features=NAME_MAX_FEATURES,
+            ngram_range=NAME_NGRAM,
+            preprocessor=build_preprocessor(df, 'name'))),
+        ('brand_name', CountVectorizer(
+            max_features=BRAND_MAX_FEATURES,
+            token_pattern=BRAND_TOKEN,
+            preprocessor=build_preprocessor(df,  'brand_name'))),
+        ('brand_name_desc', CountVectorizer(
+            max_features=10000,
+            lowercase=False,
+            ngram_range=(1,3),
+            vocabulary= brand_vocab,
+            preprocessor=build_preprocessor(df,  'item_description'))),
+        ('cat1', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df,  'cat1'))),
+        ('cat2', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df,  'cat2'))),
+        ('cat3', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df,  'cat3'))),
+        ('shipping', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'shipping'))),
+        ('item_condition_id', CountVectorizer(
+            token_pattern='.+',
+            preprocessor=build_preprocessor(df, 'item_condition_id'))),
+        ('category_name', CountVectorizer(
+            min_df = CAT_MIN_DF,
+            max_features= CAT_MAX_FEATURES,
+            token_pattern=CAT_TOKEN,
+            ngram_range=CAT_NGRAM,
+            preprocessor=build_preprocessor(df, 'category_name'))),
+        ('item_description', TfidfVectorizer(
+            min_df=DESC_MIN_DF,
+            ngram_range=DESC_NGRAM,
+            max_features=DESC_MAX_FEATURES,
+            preprocessor=build_preprocessor(df, 'item_description'))),
+                ])
+        if False and os.path.exists("../utility/ridge_exp5_{}_feats.pkl".format(str(i))):
+            with open("../utility/ridge_exp5_{}_feats.pkl".format(str(i)), "rb") as f:
+                X_feats = pickle.load(f)
+        else:
+            X_feats = vectorizer.fit_transform(df.values)
+            with open("../utility/ridge_exp5_{}_feats.pkl".format(str(i)), "wb") as f:
+                pickle.dump(X_feats, f)
+        X_all = hstack((X_feats, extra_feats)).tocsr()
+        #X_all = X_feats
+        X_all = MaxAbsScaler().fit_transform(X_all)
+        X = X_all[:nrow_train]
+        X_test = X_all[nrow_train:]
+        del X_all
+        print("Starting modelling")
+        model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        score = rmse(y, preds)
+        print("Config no. {} has oof score of {}:".format(i, score))
+        scores.append(score)
+        
+        #print("Level 2 modelling")
+        #X = hstack((X, preds.reshape(-1, 1))).tocsr()
+        #X = MaxAbsScaler().fit_transform(X)
+        #model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=100, alpha=1, tol=0.05)
+        #preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+        #score = rmse(y, preds)
+        #print("Config no. {} has level 2 oof score of {}:".format(i, score))
+        
+    best_i = np.argmax(scores)
+    best_config = configs[best_i]
+    
+    return best_config, X, X_test
+
+def main():
+    start_time = time.time()
+    t_time = start_time
+
+    train = pd.read_table('../input/train.tsv', engine='c')
+    test = pd.read_table('../input/test.tsv', engine='c')
+    
+    ### ----------------- #########
+    time_taken = time.time() - t_time
+    t_time = time.time()
+    print('[{}] Finished to load data'.format(time_taken/60))
+    print('Train shape: ', train.shape)
+    print('Test shape: ', test.shape)
+    ###------------------#########
+    
+    nrow_train = train.shape[0]
+    y = np.log1p(train["price"])
+    merge: pd.DataFrame = pd.concat([train, test])
+    submission: pd.DataFrame = test[['test_id']]
+    cvlist = list(KFold(5, random_state=1).split(train, y))
+    print("Get sub categories")
+    merge = get_sub_categories(merge)    
+    print("Convert all columns to strings")
+    merge = to_string(merge)
+    
+
+    X_counts = count_features(merge)
+    
+    ####--------->>Experiment 2 <<-----------########
+    config1, X1, X_test1 = run_experiment1(merge, X_counts, nrow_train, cvlist, y)
+    #config2, X2, X_test2 = run_experiment2(merge, X_counts, nrow_train, cvlist, y)
+    #config4, X4, X_test4 = run_experiment4(merge, X_counts, nrow_train, cvlist, y)
+    #config5, X5, X_test5 = run_experiment5(merge, X_counts, nrow_train, cvlist, y)
+    
+if __name__=="__main__":
+    main()

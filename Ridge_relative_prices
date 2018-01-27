@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jan  8 10:47:09 2018
+
+@author: mohsin
+"""
+
+import gc
+import time
+import numpy as np
+import pandas as pd
+import os
+import pickle
+
+from joblib import Parallel, delayed
+
+from scipy.sparse import csr_matrix, hstack
+
+from sklearn.linear_model import Ridge
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.linear_model import SGDRegressor
+from sklearn import metrics
+
+from sklearn.model_selection import train_test_split, cross_val_score, cross_val_predict, KFold
+from sklearn.preprocessing import LabelBinarizer, MaxAbsScaler, OneHotEncoder
+from sklearn.pipeline import make_pipeline, make_union, FeatureUnion
+
+import lightgbm as lgb
+from nltk.stem.snowball import SnowballStemmer
+import Stemmer
+
+from fuzzywuzzy import fuzz, process
+
+#Class for target encoding features
+from sklearn.base import BaseEstimator, TransformerMixin
+class TargetEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, cols=None, thresh=0, func=np.mean, add_to_orig=False):
+        self.cols = cols
+        self.thresh = thresh
+        self.func = func
+        self.add_to_orig = add_to_orig
+    
+    #@numba.jit        
+    def fit(self, X, y):
+        self.prior = self.func(y)
+        self._dict = {}
+        for col in self.cols:
+            if isinstance(col, (list, tuple)):
+                print('here')
+                tmp_df = X.loc[: ,col]
+                col = tuple(col)
+            else:
+                tmp_df = X.loc[: ,[col]]
+            tmp_df['y'] = y
+            print(tmp_df.columns)
+            #tmp_df = pd.DataFrame({'eval_col':X[col].values, 'y':y})
+            if isinstance(col, (list, tuple)):
+                print('here')
+                col = tuple(col)
+            self._dict[col] = tmp_df.groupby(col)['y'].apply(lambda x: 
+                                self.func(x) if len(x) >= self.thresh  else self.prior).to_dict()
+                                
+            del tmp_df
+        return self
+    #@numba.jit
+    def transform(self, X, y=None):
+        X_transformed = []
+        for col in self.cols:
+            
+            if isinstance(col, (list, tuple)):
+                tmp_df = X.loc[:, col]
+                enc = tmp_df[col].apply(lambda x: self._dict[tuple(col)][tuple(x)]
+                                                                     if tuple(x) in self._dict[tuple(col)]
+                                                                     else self.prior, axis=1).values
+            else:
+                tmp_df = X.loc[:, [col]]
+                enc = tmp_df[col].apply(lambda x: self._dict[col][x]
+                                                                     if x in self._dict[col]
+                                                                     else self.prior).values
+            del tmp_df
+            X_transformed.append(enc)
+        
+        X_transformed = np.vstack(X_transformed).T
+        
+        if self.add_to_orig:
+            return np.concatenate((X.values, X_transformed), axis=1)
+            
+        else:
+            return X_transformed
+#%%
+#Calculate rmse        
+def rmse(y_true, y_pred):
+    return np.sqrt(metrics.mean_squared_error(y_true, y_pred))
+
+def impute_nan(df):
+    df = df.copy()
+    df = df.fillna('missing') #Ensure string columns are handled properly downstream
+    return df
+
+def to_string(df):
+    df = df.copy()
+    df = impute_nan(df)
+    #string_cols = ["name", "brand_name", "category_name", "item_description"]
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    return df
+
+
+#def infrequent_to_nan(df, limit_dict):
+#    """Limit max """
+#    df = df.copy()
+#    for k,v in limit_dict.items():
+#        if k in df.columns:
+#            valid_vals = df[k].value_counts().iloc[:v].index
+#            df.loc[~df[k].isin(valid_vals), k] = '-2'
+#            
+#    return df
+#%%#Build vocab
+def build_vocab(df, cols, **kwargs):
+    cv = CountVectorizer(**kwargs)
+    if isinstance(cols, list) > 1:
+        cv.fit(df[cols].apply(lambda x: ' '.join(x.tolist()), axis=1))
+    else:
+        cv.fit(df[cols])
+    return cv.vocabulary_
+#%%
+#Fit count vectorizer or tfidf with given vocab
+def vectorize_col(df, col, vocab, kind='count', **kwargs):
+    if kind == 'count':
+        cv = CountVectorizer(**kwargs).set_params(vocabulary=vocab)
+    elif kind == 'tfidf':
+        cv = CountVectorizer(**kwargs).set_params(vocabulary=vocab)
+    else:
+        raise ValueError("Bad option")
+    return cv.fit_transform(df[col])
+
+#Split category name into sub categories
+def split_cat(text):
+    try: return text.split("/")
+    except: return ("No Label", "No Label", "No Label")
+    
+def get_sub_categories(df):
+    df = df.copy()
+    a, b, c = zip(*df['category_name'].apply(lambda x: split_cat(x)))
+    df["cat1"]=a
+    df["cat2"]=b
+    df["cat3"]=c
+    return df
+
+#Now get other features
+def count_features(df):
+    name_word_counts = df["name"].apply(lambda  x: len(str(x).split())).values
+    name_char_counts = df["name"].apply(lambda  x: len(str(x))).values
+    desc_word_counts = df["item_description"].apply(lambda  x: len(str(x).split())).values
+    desc_char_counts = df["item_description"].apply(lambda  x: len(str(x))).values
+    return np.vstack((name_word_counts, name_char_counts, desc_word_counts, desc_char_counts)).T
+
+default_preprocessor = CountVectorizer().build_preprocessor()
+def build_preprocessor(df, field):
+    field_idx = list(df.columns).index(field)
+    return lambda x: default_preprocessor(x[field_idx])
+
+stemmer = Stemmer.Stemmer("en")
+default_analyzer = CountVectorizer().build_analyzer()
+def build_analyzer(df, field):
+    field_idx = list(df.columns).index(field)
+    return lambda x: stemmer.stemWords(default_analyzer(x[field_idx]))
+
+#%%
+def run_experiment1(df, train, extra_feats, nrow_train, cvlist, y):
+    config0 = [1, 20000, (1, 3),
+               6000, '.+',
+               1, 1500, '.+',  (1, 1),
+               5, 100000, (1, 3)]
+
+    
+    config = config0
+    scores = []
+    #start_time = time.time()
+
+    NAME_MIN_DF,  NAME_MAX_FEATURES,  NAME_NGRAM, \
+    BRAND_MAX_FEATURES, BRAND_TOKEN, \
+    CAT_MIN_DF,  CAT_MAX_FEATURES, CAT_TOKEN, CAT_NGRAM, \
+    DESC_MIN_DF, DESC_MAX_FEATURES, DESC_NGRAM = config
+    
+    name_cat_vocab = build_vocab(df, 'name', **{'min_df':NAME_MIN_DF, 
+                                 'max_features':NAME_MAX_FEATURES, 'ngram_range':NAME_NGRAM})
+    vectorizer = FeatureUnion([
+    ('name', CountVectorizer(
+        max_features=NAME_MAX_FEATURES,
+        ngram_range=NAME_NGRAM,
+        vocabulary = name_cat_vocab,
+        preprocessor=build_preprocessor(df, 'name'))),
+    ('brand_name', CountVectorizer(
+        max_features=BRAND_MAX_FEATURES,
+        token_pattern=BRAND_TOKEN,
+        preprocessor=build_preprocessor(df,  'brand_name'))),
+    ('cat1', CountVectorizer(
+        token_pattern='.+',
+        preprocessor=build_preprocessor(df,  'cat1'))),
+    ('cat2', CountVectorizer(
+        token_pattern='.+',
+        preprocessor=build_preprocessor(df,  'cat2'))),
+    ('cat3', CountVectorizer(
+        token_pattern='.+',
+        preprocessor=build_preprocessor(df,  'cat3'))),
+    ('shipping', CountVectorizer(
+        token_pattern='.+',
+        preprocessor=build_preprocessor(df, 'shipping'))),
+    ('item_condition_id', CountVectorizer(
+        token_pattern='.+',
+        preprocessor=build_preprocessor(df, 'item_condition_id'))),
+    ('category_name', CountVectorizer(
+        min_df = CAT_MIN_DF,
+        max_features= CAT_MAX_FEATURES,
+        token_pattern=CAT_TOKEN,
+        ngram_range=CAT_NGRAM,
+        preprocessor=build_preprocessor(df, 'category_name'))),
+    ('item_description', TfidfVectorizer(
+        min_df=DESC_MIN_DF,
+        ngram_range=DESC_NGRAM,
+        max_features=DESC_MAX_FEATURES,
+        preprocessor=build_preprocessor(df, 'item_description'))),
+    ('item_description_name', CountVectorizer(
+        min_df=NAME_MIN_DF,
+        ngram_range=NAME_NGRAM,
+        max_features=NAME_MAX_FEATURES,
+        vocabulary = name_cat_vocab,
+        preprocessor=build_preprocessor(df, 'item_description')))
+            ])
+    if os.path.exists("../utility/ridge_exp1_fin_feats.pkl"):
+        with open("../utility/ridge_exp1_fin_feats.pkl", "rb") as f:
+            X_feats = pickle.load(f)
+    else:
+        X_feats = vectorizer.fit_transform(df.values)
+        with open("../utility/ridge_exp1_fin_feats.pkl", "wb") as f:
+            pickle.dump(X_feats, f)
+    X_all = hstack((X_feats, extra_feats)).tocsr()
+    #X_all = X_feats
+    X_all = MaxAbsScaler().fit_transform(X_all)
+    X = X_all[:nrow_train]
+    #X_test = X_all[nrow_train:]
+    del X_all
+    print("Starting modelling")
+    print(X.shape)
+    model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=200, alpha=1, tol=0.05)
+    preds_rd = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+    score = rmse(y, preds_rd)
+    print("Config no.has oof score of {}:".format(score))
+    scores.append(score)
+    
+    #train = df.iloc[:nrow_train-1, :]
+    #train["price"] = train["price"].astype(float)
+    cat_med_dict = train.groupby("category_name")["price"].median().to_dict()
+    train["cat_price"] = train["category_name"].apply(lambda x: cat_med_dict[x] if x in cat_med_dict else 17)
+    new_y = (train["price"] - train["cat_price"])
+    preds2 = cross_val_predict(model, X, new_y, verbose=10, n_jobs=1, cv=cvlist)
+    y_preds = np.log1p(np.clip(preds2 +  train["cat_price"], 0, 2000))
+    print(rmse(y, y_preds))
+    
+    from sklearn.linear_model import PassiveAggressiveRegressor
+    model = PassiveAggressiveRegressor(tol=0.01, C=0.005, loss='squared_epsilon_insensitive', max_iter=10)
+    preds_pa = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+    score = rmse(y, preds_pa)
+    print("Config no.has oof score of {}:".format( score))    
+    
+    model = SGDRegressor(fit_intercept=True,  tol=0.01, alpha=0.001)
+    preds_sgd = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+    score = rmse(y, preds_sgd)
+    print("Config no.has oof score of {}:".format( score))
+    
+    print("Level 2 modelling")
+    X = hstack((X, 
+                preds_rd.reshape(-1, 1), 
+                preds_pa.reshape(-1, 1), 
+                preds_sgd.reshape(-1, 1),
+                y_preds.reshape(-1, 1))).tocsr()
+    X = MaxAbsScaler().fit_transform(X)
+    #model = Ridge(solver="sag", fit_intercept=True, random_state=786, max_iter=200, alpha=0.5, tol=0.05)
+    #preds = cross_val_predict(model, X, y, verbose=10, n_jobs=1, cv=cvlist)
+    #score = rmse(y, preds)
+    print("Config no. has level 2 oof score of {}:".format( score))
+
+    params = {
+        'learning_rate': 0.3,
+        'application': 'regression',
+        'max_depth': 3,
+        'num_leaves': 100,
+        'verbosity': -1,
+        'metric': 'RMSE',
+        'nthread': 16,
+        'colsample_bytree':0.8
+    }
+    #train_X, valid_X, train_y, valid_y = train_test_split(X, y, test_size = 0.05, random_state = 144) 
+    #d_train = lgb.Dataset(train_X, label=train_y)
+    #d_valid = lgb.Dataset(valid_X, label=valid_y)
+    #watchlist = [d_train, d_valid]
+    #model = lgb.train(params, train_set=d_train, num_boost_round=10000, valid_sets=watchlist, \
+    #early_stopping_rounds=200, verbose_eval=100)     
+    
+    return
+
+def main():
+    start_time = time.time()
+    t_time = start_time
+
+    train = pd.read_table('../input/train.tsv', engine='c')
+    test = pd.read_table('../input/test.tsv', engine='c')
+    
+    ### ----------------- #########
+    time_taken = time.time() - t_time
+    t_time = time.time()
+    print('[{}] Finished to load data'.format(time_taken/60))
+    print('Train shape: ', train.shape)
+    print('Test shape: ', test.shape)
+    ###------------------#########
+    
+    nrow_train = train.shape[0]
+    y = np.log1p(train["price"])
+    merge: pd.DataFrame = pd.concat([train, test])
+    submission: pd.DataFrame = test[['test_id']]
+    cvlist = list(KFold(5, random_state=1).split(train, y))
+    print("Get sub categories")
+    merge = get_sub_categories(merge)    
+    print("Convert all columns to strings")
+    merge = to_string(merge)
+    
+
+    X_counts = count_features(merge)
+    
+    ####--------->>Experiment 2 <<-----------########
+    #config1, X1, X_test1 = run_experiment1(merge, X_counts, nrow_train, cvlist, y)
+    preds1 = run_experiment1(merge, train, X_counts, nrow_train, cvlist, y)
+    #config4, X4, X_test4 = run_experiment4(merge, X_counts, nrow_train, cvlist, y)
+    #config5, X5, X_test5 = run_experiment5(merge, X_counts, nrow_train, cvlist, y)
+
+    
+if __name__=="__main__":
+    main()
